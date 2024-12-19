@@ -1,104 +1,136 @@
 import streamlit as st
-import pandas as pd
-
+import os
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Конфигурация интерфейса Streamlit
-st.set_page_config(
-    page_title="AI Review Creator",
-    initial_sidebar_state="expanded"
-)
+# ================ Конфигурация страницы ================
+st.set_page_config(page_title="Генератор отзывов", initial_sidebar_state="expanded")
+st.title("Генератор отзывов на основе ИИ")
+st.write("Создавайте текстовые отзывы с помощью нейросети на основе категорий, рейтинга и ключевых слов.")
 
-# Заголовок приложения
-st.title("Генератор отзывов с использованием AI")
-st.write("Генерируйте оригинальные отзывы о местах по заданным параметрам: категория, рейтинг и ключевые фразы.")
-st.sidebar.title("Настройки генерации")
-
-# Кэшируем модель и токенизатор для быстрой загрузки
+# ================ Загрузка модели ================
 @st.cache_resource
 def load_model():
-    model = AutoModelForCausalLM.from_pretrained('model')  # Загрузка обученной модели
-    tokenizer = AutoTokenizer.from_pretrained('model')  # Загрузка токенизатора
-    return model, tokenizer
+    """Загрузка модели и токенизатора (кэшируется для предотвращения перезагрузки)."""
+    model_path = "./model"
+    if not os.path.exists(model_path):
+        st.error(f"Модель не найдена по пути {model_path}. Проверьте путь.")
+        st.stop()
+    try:
+        with st.spinner("Загрузка модели..."):
+            model = AutoModelForCausalLM.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+        return model, tokenizer
+    except Exception as e:
+        st.error(f"Ошибка при загрузке модели: {e}")
+        st.stop()
 
+# ================ Рейтинг звёздочками ================
+def star_rating():
+    """Выбор рейтинга с отображением звёздочек."""
+    stars = ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"]
+    selected_star = st.radio("Рейтинг:", range(1, 6), format_func=lambda x: stars[x - 1], help="Выберите оценку от 1 до 5 звёзд.")
+    return selected_star
 
-# Генерация текста на основе входных данных
-def generate_review(prompt, model, tokenizer, options):  
-    input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    output = model.generate(
-        input_ids,
-        max_length=options['max_length'],
-        num_return_sequences=options['num_return_sequences'],
-        no_repeat_ngram_size=options['no_repeat_ngram_size'],
-        do_sample=options['do_sample'],
-        top_p=options['top_p'],
-        top_k=options['top_k'],
-        temperature=options['temperature'],
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    return tokenizer.decode(output[0], skip_special_tokens=True)
-
-
-def clean_and_format(text):
-    """Форматирование текста: разделение на предложения и добавление заглавных букв."""
-    content = text.split(":")[-1].strip()
-    sentences = []
-    current_sentence = []
-    
-    for char in content:
-        current_sentence.append(char)
-        if char in '.!?':  # Конец предложения
-            sentences.append(''.join(current_sentence).strip())
-            current_sentence = []
-    
-    if current_sentence:  # Добавляем остаток текста
-        sentences.append(''.join(current_sentence).strip())
-
-    # Исправляем каждое предложение
-    formatted_sentences = []
+# ================ Форматирование текста ================
+def format_text(text):
+    """Форматирует текст: заглавные буквы и точки."""
+    sentences = text.split(". ")
+    formatted = []
     for sentence in sentences:
+        sentence = sentence.strip()
         if sentence:
-            sentence = sentence[0].upper() + sentence[1:]  # Заглавная буква
-            if not sentence.endswith('.'):
-                sentence += '.'  # Завершаем точкой
-            formatted_sentences.append(sentence)
-    
-    return ' '.join(formatted_sentences)
+            if not sentence[0].isupper():
+                sentence = sentence.capitalize()
+            if not sentence.endswith((".", "!", "?")):
+                sentence += "."
+            formatted.append(sentence)
+    return " ".join(formatted)
 
+# ================ Потоковая генерация текста ================
+def stream_generate(model, tokenizer, prompt, params, max_length, batch_size):
+    """Генерирует текст блоками с обновлением контекста."""
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    output_ids = input_ids
 
-# Основная функция приложения
+    for _ in range(max_length // batch_size):
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=output_ids,
+                max_new_tokens=batch_size,
+                temperature=params["temperature"],
+                top_p=params["top_p"],
+                top_k=params["top_k"],
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                no_repeat_ngram_size=params["no_repeat_ngram_size"],
+            )
+            new_tokens = outputs[0, output_ids.shape[1]:]
+            output_ids = torch.cat([output_ids, new_tokens.unsqueeze(0)], dim=-1)  # Обновляем контекст
+            new_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            yield new_text.strip()
+
+            if tokenizer.eos_token_id in new_tokens:
+                break
+
+# ================ Основное приложение ================
 def main():
     model, tokenizer = load_model()
 
-    if 'is_generated' not in st.session_state:
-        st.session_state['is_generated'] = False
+    # Основные параметры
+    category = st.selectbox("Категория:", ["Кафе", "Ресторан", "Парк", "Музей"])
+    rating = star_rating()
+    key_words = st.text_input("Ключевые слова", "вкусно, уютно, быстро", help="Введите ключевые слова для использования в отзыве.")
 
-    # Настройки модели
-    options = {}
-    options['max_length'] = st.sidebar.slider('Максимальная длина текста', 50, 300, 150)
-    options['num_return_sequences'] = st.sidebar.number_input('Количество текстов', 1, 5, 1)
-    options['no_repeat_ngram_size'] = st.sidebar.number_input('N-граммы (без повторений)', 1, 10, 2)
-    options['do_sample'] = st.sidebar.checkbox('Случайная генерация', True)
-    options['top_p'] = st.sidebar.slider('Top-p вероятность', 0.01, 1.00, 0.95, 0.05)
-    options['top_k'] = st.sidebar.number_input('Top-k выборка', 1, 100, 50)
-    options['temperature'] = st.sidebar.slider('Температура', 0.01, 2.00, 0.90, 0.05)
+    # Стили генерации
+    style = st.selectbox("Стиль генерации:", ["Строгий", "Умеренный", "Безумный"],
+                         help="Выберите стиль текста: Строгий – формальный и точный; Безумный – творческий и креативный.")
+    style_params = {"Строгий": (0.3, 30), "Умеренный": (0.7, 50), "Безумный": (1.5, 100)}
+    temperature, top_k = style_params[style]
 
-    # Ввод параметров пользователя
-    place_category = st.text_input("Укажите категорию:", "Ресторан")
-    user_rating = st.slider("Выберите рейтинг", 1, 5, 4)
-    keywords = st.text_input("Ключевые фразы", "цена, обслуживание, меню")
+    # Дополнительные настройки
+    with st.expander("Дополнительные настройки"):
+        max_length = st.slider("Максимальная длина", 50, 300, 150, 
+                               help="Определяет максимальное количество токенов в тексте. Большее значение увеличивает длину отзыва.")
+        num_variants = st.number_input("Количество вариантов", 1, 5, 1, 
+                                       help="Сколько вариантов текста будет сгенерировано.")
+        batch_size = st.slider("Размер батча токенов", 1, 20, 5, 
+                               help="Количество токенов, генерируемых за один шаг. Больше – быстрее, но менее плавный вывод.")
+        temperature = st.slider("Температура", 0.01, 2.0, temperature, 0.05, 
+                                help="Регулирует степень случайности текста. Низкие значения делают текст более предсказуемым.")
+        top_p = st.slider("Top-p", 0.01, 1.0, 0.9, 0.05, 
+                          help="Фильтрует токены с низкой вероятностью. Меньшие значения делают текст более логичным.")
+        top_k = st.number_input("Top-k", 1, 100, top_k, 
+                                help="Ограничивает количество рассматриваемых токенов на каждом шаге. Меньшие значения делают текст точнее.")
+        no_repeat_ngram_size = st.slider("Размер n-грамм для предотвращения повторов", 1, 10, 3, 
+                                         help="Предотвращает повторение фраз длиной n-грамм.")
 
-    # Сбор данных в единый запрос
-    user_prompt = f"Категория: {place_category}; Рейтинг: {user_rating}; Ключевые слова: {keywords} -> Отзыв:"
+    # Генерация текста
+    if st.button("Сгенерировать"):
+        if not key_words:
+            st.warning("Введите ключевые слова.")
+            return
 
-    # Кнопка генерации отзыва
-    if st.button('Сгенерировать отзыв'):
-        with st.spinner('Подождите, текст генерируется...'):
-            generated_review = generate_review(user_prompt, model, tokenizer, options)
-            formatted_review = clean_and_format(generated_review)
-        st.success("Ваш отзыв готов!")
-        st.text_area("Сгенерированный отзыв", formatted_review, height=200)
+        input_prompt = f"Категория: {category}; Рейтинг: {rating}; Ключевые слова: {key_words} -> Отзыв:"
+        st.info("Генерация текстов...")
 
+        placeholders = [st.empty() for _ in range(num_variants)]
+        texts = [""] * num_variants
 
-if __name__ == "__main__":  
+        for i in range(num_variants):
+            for chunk in stream_generate(
+                model, tokenizer, input_prompt, 
+                {"temperature": temperature, "top_p": top_p, "top_k": top_k, "no_repeat_ngram_size": no_repeat_ngram_size},
+                max_length, batch_size
+            ):
+                texts[i] += chunk + " "
+                placeholders[i].write(f"**Вариант {i + 1}:**\n{format_text(texts[i])}")
+
+        st.success("Генерация завершена!")
+
+        # Скачивание всех вариантов
+        all_texts = "\n\n".join([f"Вариант {i + 1}:\n{format_text(text)}" for i, text in enumerate(texts)])
+        st.download_button("Скачать все отзывы", all_texts, "generated_reviews.txt")
+
+if __name__ == "__main__":
     main()
